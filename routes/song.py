@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, File, Form, UploadFile
@@ -23,7 +24,7 @@ cloudinary.config(
 )
 
 @router.post('/upload',status_code=201)
-def upload_song(song: UploadFile = File(...),
+async def upload_song(song: UploadFile = File(...),
                 thumbnail: UploadFile = File(...),
                 artist: str = Form(...),
                 song_name: str = Form(...),
@@ -38,20 +39,24 @@ def upload_song(song: UploadFile = File(...),
     thumbnail_bytes = thumbnail.file.read()
 
     # 2. Upload audio as 'video'
-    song_res = cloudinary.uploader.upload(
-        song_bytes,
-        resource_type='video', 
-        folder=f'song/{song_id}'
+    # Upload both files concurrently instead of one after another
+    song_res, thumbnail_res = await asyncio.gather(
+        asyncio.to_thread(
+            cloudinary.uploader.upload,
+            song_bytes,
+            resource_type='video',
+            folder=f'song/{song_id}'
+        ),
+        asyncio.to_thread(
+            cloudinary.uploader.upload,
+            thumbnail_bytes,
+            resource_type='image',
+            folder=f'song/{song_id}'
+        ),
     )
     print("Song URL:", song_res['url'])
-    
-    # 3. Upload thumbnail as 'image'
-    thumbnail_res = cloudinary.uploader.upload(
-        thumbnail_bytes,
-        resource_type='image',
-        folder=f'song/{song_id}'
-    )
     print("Thumbnail URL:", thumbnail_res['url'])
+
 
     new_song = Song(
         id=song_id,
