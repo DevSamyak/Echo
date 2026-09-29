@@ -52,7 +52,6 @@ async def fetch_tracks(params: dict) -> list:
     query = {
         "client_id": JAMENDO_CLIENT_ID,
         "format": "json",
-        "imagesize": 500,
         **params,
     }
 
@@ -73,8 +72,19 @@ async def fetch_tracks(params: dict) -> list:
     if res.status_code != 200 or headers.get("status") != "success":
         raise HTTPException(502, headers.get("error_message") or "Jamendo request failed")
 
-    songs = [to_song(t) for t in body.get("results", []) if t.get("audio")]
-    _cache[cache_key] = (time.time(), songs)
+    results = body.get("results", [])
+    songs = [to_song(t) for t in results if t.get("audio")]
+    # Visible in Render's Logs tab: how many tracks Jamendo sent vs how many
+    # had a stream URL.
+    print(f"[jamendo] params={params} raw={len(results)} usable={len(songs)}")
+    if not songs:
+        print(f"[jamendo] headers={headers}")
+        if results:
+            print(f"[jamendo] first result keys={list(results[0].keys())}")
+
+    # Don't cache empty answers, so a fixed problem shows up immediately.
+    if songs:
+        _cache[cache_key] = (time.time(), songs)
     return songs
 
 
@@ -88,7 +98,9 @@ async def list_tracks(
 ):
     if order not in ALLOWED_ORDERS:
         raise HTTPException(400, f"order must be one of {sorted(ALLOWED_ORDERS)}")
-    params = {"order": order, "limit": limit, "offset": offset}
+    params = {"order": order, "limit": limit}
+    if offset:
+        params["offset"] = offset
     if tag:
         params["tags"] = tag
     return await fetch_tracks(params)
@@ -101,4 +113,7 @@ async def search_tracks(
     offset: int = Query(0, ge=0),
     auth_details=Depends(auth_middleware.AuthMiddleware),
 ):
-    return await fetch_tracks({"search": q, "limit": limit, "offset": offset})
+    params = {"search": q, "limit": limit}
+    if offset:
+        params["offset"] = offset
+    return await fetch_tracks(params)
