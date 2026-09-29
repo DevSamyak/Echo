@@ -1,5 +1,6 @@
 import os
 import time
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -27,7 +28,7 @@ ALLOWED_ORDERS = {
 
 # Tiny in-memory cache so the home screen doesn't hit Jamendo on every open.
 CACHE_TTL_SECONDS = 300
-_cache: dict[tuple, tuple[float, list]] = {}
+_cache: dict = {}  # cache_key -> (timestamp, songs)
 
 
 def to_song(track: dict) -> dict:
@@ -44,7 +45,7 @@ def to_song(track: dict) -> dict:
     }
 
 
-async def fetch_tracks(params: dict) -> list[dict]:
+async def fetch_tracks(params: dict) -> list:
     if not JAMENDO_CLIENT_ID:
         raise HTTPException(500, "JAMENDO_CLIENT_ID is not configured on the server")
 
@@ -80,7 +81,7 @@ async def fetch_tracks(params: dict) -> list[dict]:
 @router.get("/tracks")
 async def list_tracks(
     order: str = "popularity_week",
-    tag: str | None = None,
+    tag: Optional[str] = None,
     limit: int = Query(20, ge=1, le=50),
     offset: int = Query(0, ge=0),
     auth_details=Depends(auth_middleware.AuthMiddleware),
