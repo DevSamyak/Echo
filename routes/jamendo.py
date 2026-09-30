@@ -1,3 +1,4 @@
+import html
 import os
 import time
 from typing import Optional
@@ -37,8 +38,9 @@ def to_song(track: dict) -> dict:
     Flutter app can parse it with the existing SongModel."""
     return {
         "id": f"jamendo_{track['id']}",
-        "song_name": track.get("name") or "",
-        "artist": track.get("artist_name") or "",
+        # Jamendo sends HTML entities ("Bessonn&amp;sa"), so decode them.
+        "song_name": html.unescape(track.get("name") or ""),
+        "artist": html.unescape(track.get("artist_name") or ""),
         "thumbnail_url": track.get("image") or track.get("album_image") or "",
         "song_url": track.get("audio") or "",
         "hex_code": DEFAULT_HEX,
