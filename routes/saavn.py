@@ -1,18 +1,26 @@
 import asyncio
 import html
+import json
 import os
 import re
 import time
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from database import SessionLocal
 from middleware import auth_middleware
+from models.feed_cache import FeedCache
 
 load_dotenv()
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 # Base URL of YOUR deployed jiosaavn-api instance, no trailing slash.
 # e.g. http://localhost:8000 while testing, https://echo-saavn.onrender.com later.
@@ -22,11 +30,13 @@ SAAVN_API_URL = (os.getenv("SAAVN_API_URL") or "").rstrip("/")
 DEFAULT_HEX = "4A3F8F"
 
 # jiosaavn-api has no "trending" endpoint, only search, and each search returns
-# only a handful of songs. So each Discover row merges a few curated queries. The app sends a section key; only these are accepted.
+# only a handful of songs. So each Discover row merges a few curated queries.
+# The app sends a section key; only these are accepted.
 # Tweak the query strings freely, they are just search terms.
+# (trending/new use 3 queries to keep the one-time first load short.)
 SECTIONS = {
-    "trending": ["Top Hindi songs", "Pritam", "Arijit Singh", "Shreya Ghoshal"],
-    "new": ["New Hindi songs", "Latest Bollywood", "Vishal Mishra", "Sachin Jigar"],
+    "trending": ["Top Hindi songs", "Arijit Singh", "Pritam"],
+    "new": ["New Hindi songs", "Latest Bollywood", "Vishal Mishra"],
     "punjabi": ["Punjabi hits", "Diljit Dosanjh", "AP Dhillon", "Sidhu Moose Wala"],
     "romantic": ["Hindi romantic songs", "Atif Aslam", "Jubin Nautiyal", "Darshan Raval"],
     "retro": ["Kishore Kumar", "Lata Mangeshkar", "Mohammed Rafi", "R D Burman"],
@@ -38,13 +48,87 @@ SECTIONS = {
 
 # How many songs to request per search from the Saavn service. Duplicates
 # (same song on several albums) are removed afterwards, so ask for extra.
-UPSTREAM_LIMIT = 25      # for the Search tab
-SECTION_UPSTREAM = 8   # per query, for Discover rows (each row runs 3-4 queries)
+UPSTREAM_LIMIT = 25     # for the Search tab
+SECTION_UPSTREAM = 8    # per query, for Discover rows
 
-# Saavn CDN URLs have no documented expiry, but keep the cache short anyway.
+# In-memory per-query cache (lost on restart). Saavn CDN URLs have no
+# documented expiry, but keep it short anyway.
 CACHE_TTL_SECONDS = 600
-_cache: dict = {}  # query -> (timestamp, songs)
-_upstream_sem = asyncio.Semaphore(2)
+_cache: dict = {}  # (query, upstream) -> (timestamp, songs)
+
+# Persistent per-section cache lives in Postgres (table: feed_cache).
+FEED_FRESH = timedelta(minutes=30)   # older than this -> refresh in background
+MIN_SONGS_TO_STORE = 8               # never overwrite the cache with a tiny result
+_refreshing: set = set()             # sections currently being refreshed
+_tasks: set = set()                  # keeps background tasks from being garbage collected
+
+# Limit concurrent upstream calls (the free Render instance is tiny).
+# Created lazily so it binds to the running event loop (matters on Python 3.9).
+_upstream_sem: Optional[asyncio.Semaphore] = None
+
+
+def _sem() -> asyncio.Semaphore:
+    global _upstream_sem
+    if _upstream_sem is None:
+        _upstream_sem = asyncio.Semaphore(2)
+    return _upstream_sem
+
+
+# ---------------------------------------------------------------------------
+# Postgres feed cache helpers
+# ---------------------------------------------------------------------------
+
+def _spawn(coro):
+    t = asyncio.create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+
+
+def _db_get(key: str):
+    db = SessionLocal()
+    try:
+        row = db.query(FeedCache).filter_by(key=key).first()
+        return (json.loads(row.value), row.updated_at) if row else (None, None)
+    finally:
+        db.close()
+
+
+def _db_set(key: str, songs: list):
+    db = SessionLocal()
+    try:
+        db.merge(
+            FeedCache(
+                key=key,
+                value=json.dumps(songs),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+async def _refresh_section(section: str):
+    """Fetch a section from Saavn and store it in Postgres. Safe to call many
+    times at once: only one refresh per section runs at a time."""
+    if section in _refreshing:
+        return
+    _refreshing.add(section)
+    try:
+        songs = await fetch_section(SECTIONS[section], 50)
+        if len(songs) >= MIN_SONGS_TO_STORE:
+            await asyncio.to_thread(_db_set, f"feed:{section}", songs)
+        else:
+            print(f"[saavn] refresh {section}: only {len(songs)} songs, not stored")
+    except Exception as e:
+        print(f"[saavn] refresh {section} failed: {e!r}")
+    finally:
+        _refreshing.discard(section)
+
+
+# ---------------------------------------------------------------------------
+# Saavn -> Echo song shape
+# ---------------------------------------------------------------------------
 
 def _big_image(url: str) -> str:
     """Saavn sends 150x150 thumbnails by default; ask the CDN for 500x500."""
@@ -91,6 +175,10 @@ def _clean_query(q: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[&#?+%/\\]", " ", q)).strip()
 
 
+# ---------------------------------------------------------------------------
+# Upstream fetching
+# ---------------------------------------------------------------------------
+
 async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) -> list:
     query = _clean_query(query)
     if not query:
@@ -102,8 +190,9 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
         return cached[1][:limit]
 
+    res = None
     try:
-        async with _upstream_sem:
+        async with _sem():
             async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
                 res = await client.get(
                     f"{SAAVN_API_URL}/song/",
@@ -116,9 +205,11 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
                 )
         body = res.json()
     except (httpx.HTTPError, ValueError) as e:
-        print(f"[saavn] upstream failed: {type(e).__name__}: {e!r} query={query!r}")
+        status = res.status_code if res is not None else "n/a"
+        print(f"[saavn] upstream failed: {type(e).__name__}: {e!r} query={query!r} status={status}")
         raise HTTPException(502, "Could not reach the Saavn service")
     if res.status_code != 200 or not isinstance(body, list):
+        print(f"[saavn] unexpected response: status={res.status_code} query={query!r}")
         raise HTTPException(502, "Saavn service returned an unexpected response")
 
     songs, seen = [], set()
@@ -138,7 +229,8 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
 
 
 async def fetch_section(queries: list, limit: int) -> list:
-    """Run every query of a section in parallel, merge, drop duplicates."""
+    """Run every query of a section (at most 2 hit Saavn at once, see _sem),
+    merge, drop duplicates."""
     results = await asyncio.gather(
         *(fetch_songs(q, 50, SECTION_UPSTREAM) for q in queries),
         return_exceptions=True,
@@ -159,6 +251,10 @@ async def fetch_section(queries: list, limit: int) -> list:
     return merged[:limit]
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @router.get("/feed")
 async def feed(
     section: str = "trending",
@@ -167,7 +263,30 @@ async def feed(
 ):
     if section not in SECTIONS:
         raise HTTPException(400, f"section must be one of {sorted(SECTIONS)}")
-    return await fetch_section(SECTIONS[section], limit)
+
+    key = f"feed:{section}"
+    cached, updated = await asyncio.to_thread(_db_get, key)
+
+    if cached:
+        # Answer instantly; refresh in the background if the copy is old.
+        if datetime.now(timezone.utc) - updated > FEED_FRESH:
+            _spawn(_refresh_section(section))
+        return cached[:limit]
+
+    # Very first request for this section: nothing stored yet, so wait for the
+    # fetch (ours, or one another request already started).
+    if section in _refreshing:
+        for _ in range(90):
+            await asyncio.sleep(1)
+            if section not in _refreshing:
+                break
+    else:
+        await _refresh_section(section)
+
+    cached, _ = await asyncio.to_thread(_db_get, key)
+    if not cached:
+        raise HTTPException(502, "Could not reach the Saavn service")
+    return cached[:limit]
 
 
 @router.get("/search")
