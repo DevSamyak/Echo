@@ -5,6 +5,9 @@ from routes import auth, song, saavn
 from database import engine
 app = FastAPI()
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 app.include_router(auth.router,prefix='/auth')
 app.include_router(song.router,prefix='/song')
 app.include_router(saavn.router,prefix='/saavn')

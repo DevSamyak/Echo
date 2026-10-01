@@ -39,12 +39,12 @@ SECTIONS = {
 # How many songs to request per search from the Saavn service. Duplicates
 # (same song on several albums) are removed afterwards, so ask for extra.
 UPSTREAM_LIMIT = 25      # for the Search tab
-SECTION_UPSTREAM = 15    # per query, for Discover rows (each row runs 3-4 queries)
+SECTION_UPSTREAM = 8   # per query, for Discover rows (each row runs 3-4 queries)
 
 # Saavn CDN URLs have no documented expiry, but keep the cache short anyway.
 CACHE_TTL_SECONDS = 600
 _cache: dict = {}  # query -> (timestamp, songs)
-
+_upstream_sem = asyncio.Semaphore(2)
 
 def _big_image(url: str) -> str:
     """Saavn sends 150x150 thumbnails by default; ask the CDN for 500x500."""
@@ -103,21 +103,21 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
         return cached[1][:limit]
 
     try:
-        # Long timeout: a sleeping Render free instance needs time to wake up.
-        async with httpx.AsyncClient(timeout=60) as client:
-            res = await client.get(
-                f"{SAAVN_API_URL}/song/",
-                params={
-                    "query": query,
-                    "lyrics": "false",
-                    "songdata": "true",
-                    "limit": upstream,  # ignored by an un-patched clone
-                },
-            )
+        async with _upstream_sem:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
+                res = await client.get(
+                    f"{SAAVN_API_URL}/song/",
+                    params={
+                        "query": query,
+                        "lyrics": "false",
+                        "songdata": "true",
+                        "limit": upstream,
+                    },
+                )
         body = res.json()
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError) as e:
+        print(f"[saavn] upstream failed: {type(e).__name__}: {e!r} query={query!r}")
         raise HTTPException(502, "Could not reach the Saavn service")
-
     if res.status_code != 200 or not isinstance(body, list):
         raise HTTPException(502, "Saavn service returned an unexpected response")
 
