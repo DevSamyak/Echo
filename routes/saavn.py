@@ -189,24 +189,32 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
     cached = _cache.get((query, upstream))
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
         return cached[1][:limit]
-
-    res = None
-    try:
-        async with _sem():
-            async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
-                res = await client.get(
-                    f"{SAAVN_API_URL}/song/",
-                    params={
-                        "query": query,
-                        "lyrics": "false",
-                        "songdata": "true",
-                        "limit": upstream,
-                    },
-                )
-        body = res.json()
-    except (httpx.HTTPError, ValueError) as e:
-        status = res.status_code if res is not None else "n/a"
-        print(f"[saavn] upstream failed: {type(e).__name__}: {e!r} query={query!r} status={status}")
+        res, body = None, None
+    for attempt in range(1, 6):
+        try:
+            async with _sem():
+                async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
+                    res = await client.get(
+                        f"{SAAVN_API_URL}/song/",
+                        params={
+                            "query": query,
+                            "lyrics": "false",
+                            "songdata": "true",
+                            "limit": upstream,
+                        },
+                    )
+            if res.status_code in (502, 503, 504):
+                # Render's proxy answers like this while the service is starting/restarting
+                raise ValueError(f"service not ready (HTTP {res.status_code})")
+            body = res.json()
+            break
+        except (httpx.HTTPError, ValueError) as e:
+            status = res.status_code if res is not None else "n/a"
+            print(f"[saavn] attempt {attempt}/5 failed: {type(e).__name__}: {e!r} query={query!r} status={status}")
+            res = None
+            if attempt < 5:
+                await asyncio.sleep(min(5 * attempt, 15))  # waits 5s, 10s, 15s, 15s
+    if body is None:
         raise HTTPException(502, "Could not reach the Saavn service")
     if res.status_code != 200 or not isinstance(body, list):
         print(f"[saavn] unexpected response: status={res.status_code} query={query!r}")
