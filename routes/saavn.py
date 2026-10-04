@@ -189,7 +189,7 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
     cached = _cache.get((query, upstream))
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
         return cached[1][:limit]
-        res, body = None, None
+    res, body = None, None
     for attempt in range(1, 6):
         try:
             async with _sem():
