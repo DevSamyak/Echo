@@ -22,18 +22,9 @@ router = APIRouter()
 # Config
 # ---------------------------------------------------------------------------
 
-# Base URL of YOUR deployed jiosaavn-api instance, no trailing slash.
-# e.g. http://localhost:8000 while testing, https://echo-saavn.onrender.com later.
 SAAVN_API_URL = (os.getenv("SAAVN_API_URL") or "").rstrip("/")
-
-# Same placeholder colour as Jamendo tracks (6 chars, no '#').
 DEFAULT_HEX = "4A3F8F"
 
-# jiosaavn-api has no "trending" endpoint, only search, and each search returns
-# only a handful of songs. So each Discover row merges a few curated queries.
-# The app sends a section key; only these are accepted.
-# Tweak the query strings freely, they are just search terms.
-# (trending/new use 3 queries to keep the one-time first load short.)
 SECTIONS = {
     "trending": ["Top Hindi songs", "Arijit Singh", "Pritam"],
     "new": ["New Hindi songs", "Latest Bollywood", "Vishal Mishra"],
@@ -46,24 +37,17 @@ SECTIONS = {
     "telugu": ["Telugu hits", "Devi Sri Prasad", "Thaman S", "Sid Sriram"],
 }
 
-# How many songs to request per search from the Saavn service. Duplicates
-# (same song on several albums) are removed afterwards, so ask for extra.
-UPSTREAM_LIMIT = 25     # for the Search tab
-SECTION_UPSTREAM = 8    # per query, for Discover rows
+UPSTREAM_LIMIT = 25     
+SECTION_UPSTREAM = 8    
 
-# In-memory per-query cache (lost on restart). Saavn CDN URLs have no
-# documented expiry, but keep it short anyway.
 CACHE_TTL_SECONDS = 600
-_cache: dict = {}  # (query, upstream) -> (timestamp, songs)
+_cache: dict = {}  # (query, upstream, page) -> (timestamp, songs)
 
-# Persistent per-section cache lives in Postgres (table: feed_cache).
-FEED_FRESH = timedelta(minutes=30)   # older than this -> refresh in background
-MIN_SONGS_TO_STORE = 8               # never overwrite the cache with a tiny result
-_refreshing: set = set()             # sections currently being refreshed
-_tasks: set = set()                  # keeps background tasks from being garbage collected
+FEED_FRESH = timedelta(minutes=30)   
+MIN_SONGS_TO_STORE = 8               
+_refreshing: set = set()             
+_tasks: set = set()                  
 
-# Limit concurrent upstream calls (the free Render instance is tiny).
-# Created lazily so it binds to the running event loop (matters on Python 3.9).
 _upstream_sem: Optional[asyncio.Semaphore] = None
 
 
@@ -108,22 +92,21 @@ def _db_set(key: str, songs: list):
         db.close()
 
 
-async def _refresh_section(section: str):
-    """Fetch a section from Saavn and store it in Postgres. Safe to call many
-    times at once: only one refresh per section runs at a time."""
-    if section in _refreshing:
+async def _refresh_section(section: str, page: int = 1):
+    refresh_key = f"{section}:{page}"
+    if refresh_key in _refreshing:
         return
-    _refreshing.add(section)
+    _refreshing.add(refresh_key)
     try:
-        songs = await fetch_section(SECTIONS[section], 50)
+        songs = await fetch_section(SECTIONS[section], 50, page)
         if len(songs) >= MIN_SONGS_TO_STORE:
-            await asyncio.to_thread(_db_set, f"feed:{section}", songs)
+            await asyncio.to_thread(_db_set, f"feed:{section}:{page}", songs)
         else:
-            print(f"[saavn] refresh {section}: only {len(songs)} songs, not stored")
+            print(f"[saavn] refresh {refresh_key}: only {len(songs)} songs, not stored")
     except Exception as e:
-        print(f"[saavn] refresh {section} failed: {e!r}")
+        print(f"[saavn] refresh {refresh_key} failed: {e!r}")
     finally:
-        _refreshing.discard(section)
+        _refreshing.discard(refresh_key)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +114,6 @@ async def _refresh_section(section: str):
 # ---------------------------------------------------------------------------
 
 def _big_image(url: str) -> str:
-    """Saavn sends 150x150 thumbnails by default; ask the CDN for 500x500."""
     if not url:
         return ""
     return (
@@ -140,11 +122,6 @@ def _big_image(url: str) -> str:
 
 
 def to_song(track: dict) -> Optional[dict]:
-    """Reshape a jiosaavn-api song into the same JSON shape as an uploaded
-    song (id, song_name, artist, thumbnail_url, song_url, hex_code), so the
-    Flutter app can parse it with the existing SongModel.
-
-    Returns None when the track has no playable URL."""
     stream = (track.get("media_url") or "").strip()
     if not stream or not track.get("id"):
         return None
@@ -161,17 +138,12 @@ def to_song(track: dict) -> Optional[dict]:
 
 
 def _dedupe_key(song: dict) -> tuple:
-    """Saavn lists the same track once per album (original film album,
-    compilations, "Best of" playlists...), each with its own id. Treat songs
-    with the same title and the same set of artists as one."""
     title = re.sub(r"\s*\((?:from|film|movie)\b[^)]*\)", "", song["song_name"], flags=re.I)
     artists = frozenset(a.strip().lower() for a in song["artist"].split(",") if a.strip())
     return (title.strip().lower(), artists)
 
 
 def _clean_query(q: str) -> str:
-    """jiosaavn-api pastes the query into a URL without encoding it, so
-    characters like & # ? + % would break the upstream request."""
     return re.sub(r"\s+", " ", re.sub(r"[&#?+%/\\]", " ", q)).strip()
 
 
@@ -179,14 +151,14 @@ def _clean_query(q: str) -> str:
 # Upstream fetching
 # ---------------------------------------------------------------------------
 
-async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) -> list:
+async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT, page: int = 1) -> list:
     query = _clean_query(query)
     if not query:
         return []
     if not SAAVN_API_URL:
         raise HTTPException(500, "SAAVN_API_URL is not configured on the server")
 
-    cached = _cache.get((query, upstream))
+    cached = _cache.get((query, upstream, page))
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
         return cached[1][:limit]
     res, body = None, None
@@ -201,10 +173,10 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
                             "lyrics": "false",
                             "songdata": "true",
                             "limit": upstream,
+                            "page": page,
                         },
                     )
             if res.status_code in (502, 503, 504):
-                # Render's proxy answers like this while the service is starting/restarting
                 raise ValueError(f"service not ready (HTTP {res.status_code})")
             body = res.json()
             break
@@ -213,7 +185,8 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
             print(f"[saavn] attempt {attempt}/5 failed: {type(e).__name__}: {e!r} query={query!r} status={status}")
             res = None
             if attempt < 5:
-                await asyncio.sleep(min(5 * attempt, 15))  # waits 5s, 10s, 15s, 15s
+                await asyncio.sleep(min(5 * attempt, 15))
+                
     if body is None:
         raise HTTPException(502, "Could not reach the Saavn service")
     if res.status_code != 200 or not isinstance(body, list):
@@ -227,24 +200,19 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT) ->
             seen.add(_dedupe_key(song))
             songs.append(song)
 
-    # Visible in Render's Logs tab.
-    print(f"[saavn] query={query!r} raw={len(body)} usable={len(songs)}")
+    print(f"[saavn] query={query!r} page={page} raw={len(body)} usable={len(songs)}")
 
-    # Don't cache empty answers, so a fixed problem shows up immediately.
     if songs:
-        _cache[(query, upstream)] = (time.time(), songs)
+        _cache[(query, upstream, page)] = (time.time(), songs)
     return songs[:limit]
 
 
-async def fetch_section(queries: list, limit: int) -> list:
-    """Run every query of a section (at most 2 hit Saavn at once, see _sem),
-    merge, drop duplicates."""
+async def fetch_section(queries: list, limit: int, page: int = 1) -> list:
     results = await asyncio.gather(
-        *(fetch_songs(q, 50, SECTION_UPSTREAM) for q in queries),
+        *(fetch_songs(q, 50, SECTION_UPSTREAM, page) for q in queries),
         return_exceptions=True,
     )
     merged, seen = [], set()
-    # Round-robin so one query doesn't fill the whole row.
     lists = [r for r in results if isinstance(r, list)]
     for i in range(max((len(r) for r in lists), default=0)):
         for r in lists:
@@ -252,7 +220,6 @@ async def fetch_section(queries: list, limit: int) -> list:
                 seen.add(_dedupe_key(r[i]))
                 merged.append(r[i])
     if not merged:
-        # Every query failed: surface the first real error instead of [].
         for r in results:
             if isinstance(r, HTTPException):
                 raise r
@@ -267,29 +234,28 @@ async def fetch_section(queries: list, limit: int) -> list:
 async def feed(
     section: str = "trending",
     limit: int = Query(20, ge=1, le=50),
+    page: int = Query(1, ge=1),
     auth_details=Depends(auth_middleware.AuthMiddleware),
 ):
     if section not in SECTIONS:
         raise HTTPException(400, f"section must be one of {sorted(SECTIONS)}")
 
-    key = f"feed:{section}"
+    key = f"feed:{section}:{page}"
     cached, updated = await asyncio.to_thread(_db_get, key)
 
     if cached:
-        # Answer instantly; refresh in the background if the copy is old.
         if datetime.now(timezone.utc) - updated > FEED_FRESH:
-            _spawn(_refresh_section(section))
+            _spawn(_refresh_section(section, page))
         return cached[:limit]
 
-    # Very first request for this section: nothing stored yet, so wait for the
-    # fetch (ours, or one another request already started).
-    if section in _refreshing:
+    refresh_key = f"{section}:{page}"
+    if refresh_key in _refreshing:
         for _ in range(90):
             await asyncio.sleep(1)
-            if section not in _refreshing:
+            if refresh_key not in _refreshing:
                 break
     else:
-        await _refresh_section(section)
+        await _refresh_section(section, page)
 
     cached, _ = await asyncio.to_thread(_db_get, key)
     if not cached:
@@ -301,6 +267,7 @@ async def feed(
 async def search(
     q: str = Query(..., min_length=1, max_length=100),
     limit: int = Query(20, ge=1, le=50),
+    page: int = Query(1, ge=1),
     auth_details=Depends(auth_middleware.AuthMiddleware),
 ):
-    return await fetch_songs(q.strip(), limit)
+    return await fetch_songs(q.strip(), limit, page=page)
