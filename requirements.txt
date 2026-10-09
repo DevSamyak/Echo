@@ -49,4 +49,4 @@ uvloop==0.22.1
 watchfiles==1.1.1
 websockets==15.0.1
 pyDes==2.0.1
-requests==2.33.0
+requests==2.32.5
