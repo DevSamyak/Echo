@@ -53,8 +53,9 @@ _upstream_sem: Optional[asyncio.Semaphore] = None
 
 def _sem() -> asyncio.Semaphore:
     global _upstream_sem
+    # Set to 1: Serializes calls to prevent crashing the free Render container
     if _upstream_sem is None:
-        _upstream_sem = asyncio.Semaphore(2)
+        _upstream_sem = asyncio.Semaphore(1)
     return _upstream_sem
 
 
@@ -161,10 +162,14 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT, pa
     cached = _cache.get((query, upstream, page))
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
         return cached[1][:limit]
+
     res, body = None, None
     for attempt in range(1, 6):
         try:
             async with _sem():
+                # Add a 1-second delay between upstream requests to prevent rate limiting
+                await asyncio.sleep(1.0)
+                
                 async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=15)) as client:
                     res = await client.get(
                         f"{SAAVN_API_URL}/song/",
@@ -176,21 +181,33 @@ async def fetch_songs(query: str, limit: int, upstream: int = UPSTREAM_LIMIT, pa
                             "page": page,
                         },
                     )
+
+            # Explicitly catch rate limits before attempting to decode JSON
+            if res.status_code == 429:
+                raise ValueError("Rate limited by JioSaavn (HTTP 429)")
+
+            # Catch Render proxy errors while waking up
             if res.status_code in (502, 503, 504):
-                raise ValueError(f"service not ready (HTTP {res.status_code})")
+                raise ValueError(f"Service not ready (HTTP {res.status_code})")
+
+            res.raise_for_status()
+            
+            # Parse response only if successful
             body = res.json()
             break
-        except (httpx.HTTPError, ValueError) as e:
+
+        except (httpx.HTTPError, ValueError, json.JSONDecodeError) as e:
             status = res.status_code if res is not None else "n/a"
             print(f"[saavn] attempt {attempt}/5 failed: {type(e).__name__}: {e!r} query={query!r} status={status}")
             res = None
             if attempt < 5:
-                await asyncio.sleep(min(5 * attempt, 15))
+                # Progressive backoff to let Render/Saavn recover
+                await asyncio.sleep(min(3 * attempt, 15))
                 
     if body is None:
         raise HTTPException(502, "Could not reach the Saavn service")
-    if res.status_code != 200 or not isinstance(body, list):
-        print(f"[saavn] unexpected response: status={res.status_code} query={query!r}")
+    if not isinstance(body, list):
+        print(f"[saavn] unexpected response: status={res.status_code if res else 'n/a'} query={query!r}")
         raise HTTPException(502, "Saavn service returned an unexpected response")
 
     songs, seen = [], set()
