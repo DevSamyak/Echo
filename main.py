@@ -6,7 +6,10 @@ from database import engine
 app = FastAPI()
 
 @app.api_route("/health", methods=["GET", "HEAD"])
-def health():
+async def health():
+    # The keep-alive ping also tops up the home rows when they are stale
+    # (memory check only, so the ping never touches the database).
+    saavn.warm_stale()
     return {"status": "ok"}
 app.include_router(auth.router,prefix='/auth')
 app.include_router(song.router,prefix='/song')
