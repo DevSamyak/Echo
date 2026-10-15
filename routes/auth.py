@@ -1,10 +1,14 @@
-#this contains business logic 
+#this contains business logic
+import json
 import os
 import uuid
+
 import bcrypt
+import firebase_admin
 import jwt
 from dotenv import load_dotenv
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException
+from firebase_admin import auth as firebase_auth, credentials
 from sqlalchemy.orm import Session, joinedload
 
 from database import get_db
@@ -20,54 +24,73 @@ router = APIRouter()
 
 JWT_SECRET = os.getenv("JWT_SECRET_KEY")
 
-# Firebase Admin SDK imports & initialization
-try:
-    import firebase_admin
-    from firebase_admin import auth as firebase_auth, credentials
-except ImportError:
-    firebase_admin = None
-    firebase_auth = None
-    credentials = None
 
-# Initialize Firebase Admin (do this once at module level)
-if firebase_admin is not None and not firebase_admin._apps:
-    service_account_path = os.getenv('FIREBASE_SERVICE_ACCOUNT_PATH', 'firebase-service-account.json')
-    try:
-        if os.path.exists(service_account_path):
-            cred = credentials.Certificate(service_account_path)
-            firebase_admin.initialize_app(cred)
-        else:
-            try:
-                # Attempt default credentials if service account file is not found
-                firebase_admin.initialize_app()
-            except Exception as default_err:
-                print(
-                    f"Warning: Firebase service account file '{service_account_path}' not found "
-                    f"and default credentials unavailable ({default_err}). "
-                    "Firebase authentication will not work until credentials are provided."
-                )
-    except Exception as e:
-        print(f"Error initializing Firebase Admin SDK with '{service_account_path}': {e}")
+# ---------------------------------------------------------------------------
+# Firebase Admin SDK setup (runs once when the server starts)
+# ---------------------------------------------------------------------------
+# Credentials are read from, in this order:
+#   1. FIREBASE_SERVICE_ACCOUNT_JSON  -> the whole JSON pasted into an env var
+#   2. FIREBASE_SERVICE_ACCOUNT_PATH  -> path to the JSON file
+#                                        (Render Secret File: /etc/secrets/firebase-service-account.json)
+#                                        default: firebase-service-account.json next to main.py
+# If neither exists the server stops at startup with a clear message,
+# instead of starting and failing on the first login.
+def _init_firebase():
+    if firebase_admin._apps:
+        return
+    raw = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+    path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "firebase-service-account.json")
+    if raw:
+        cred = credentials.Certificate(json.loads(raw))
+    elif os.path.exists(path):
+        cred = credentials.Certificate(path)
+    else:
+        raise RuntimeError(
+            f"Firebase credentials not found. Set FIREBASE_SERVICE_ACCOUNT_PATH "
+            f"(looked at '{path}') or FIREBASE_SERVICE_ACCOUNT_JSON."
+        )
+    firebase_admin.initialize_app(cred)
+
+
+_init_firebase()
+
+
+# ---------------------------------------------------------------------------
+# Response shape: never send the password hash (or firebase_uid) to the app
+# ---------------------------------------------------------------------------
+def _user_out(u: User) -> dict:
+    return {
+        "id": u.id,
+        "name": u.name,
+        "email": u.email,
+        "phone": u.phone,
+        "favourites": [
+            {"id": f.id, "song_id": f.song_id, "user_id": f.user_id}
+            for f in (u.favourites or [])
+        ],
+    }
+
+
+def _load_with_favourites(db: Session, user_id: str):
+    return (
+        db.query(User)
+        .filter(User.id == user_id)
+        .options(joinedload(User.favourites))
+        .first()
+    )
 
 
 @router.post('/firebase')
 def firebase_login(auth_data: FirebaseAuth, db: Session = Depends(get_db)):
     """Authenticate or register a user using a Firebase ID token.
+    Sign up and sign in are the same call: the user is created on first login.
     Returns app JWT token and user profile."""
-    if firebase_admin is None or firebase_auth is None:
-        raise HTTPException(
-            status_code=500,
-            detail="firebase-admin is not installed on the server. Please run 'pip install firebase-admin'."
-        )
-
-    if not firebase_admin._apps:
-        raise HTTPException(
-            status_code=500,
-            detail="Firebase Admin SDK is not initialized. Please configure FIREBASE_SERVICE_ACCOUNT_PATH or credentials."
-        )
-
     try:
-        decoded_token = firebase_auth.verify_id_token(auth_data.firebase_token)
+        # clock_skew_seconds avoids random "Token used too early" errors
+        # when the phone's clock is a few seconds ahead of the server's.
+        decoded_token = firebase_auth.verify_id_token(
+            auth_data.firebase_token, clock_skew_seconds=10
+        )
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid or expired Firebase token: {str(e)}")
 
@@ -83,7 +106,7 @@ def firebase_login(auth_data: FirebaseAuth, db: Session = Depends(get_db)):
     user_db = db.query(User).filter(User.firebase_uid == uid).options(joinedload(User.favourites)).first()
 
     if not user_db:
-        # Check if an existing account with the same email exists to link
+        # Check if an existing (old email/password) account with the same email exists to link
         if email:
             existing_user = db.query(User).filter(User.email == email).options(joinedload(User.favourites)).first()
             if existing_user and not existing_user.firebase_uid:
@@ -108,12 +131,9 @@ def firebase_login(auth_data: FirebaseAuth, db: Session = Depends(get_db)):
             db.add(user_db)
             db.commit()
             db.refresh(user_db)
-            # Reload with favourites joined if available
-            reloaded_user = db.query(User).filter(User.id == user_db.id).options(joinedload(User.favourites)).first()
-            if reloaded_user:
-                user_db = reloaded_user
+            user_db = _load_with_favourites(db, user_db.id) or user_db
     else:
-        # If user exists, optionally update name/email/phone if they were previously empty
+        # If user exists, fill in name/email/phone if they were previously empty
         updated = False
         if not user_db.name and name:
             user_db.name = name
@@ -128,12 +148,10 @@ def firebase_login(auth_data: FirebaseAuth, db: Session = Depends(get_db)):
         if updated:
             db.commit()
             db.refresh(user_db)
-            reloaded_user = db.query(User).filter(User.id == user_db.id).options(joinedload(User.favourites)).first()
-            if reloaded_user:
-                user_db = reloaded_user
+            user_db = _load_with_favourites(db, user_db.id) or user_db
 
     token = jwt.encode(payload={'id': user_db.id}, key=JWT_SECRET)
-    return {'token': token, 'user': user_db}
+    return {'token': token, 'user': _user_out(user_db)}
 
 
 # DEPRECATED: Email/password signup is deprecated. Use POST /auth/firebase instead.
@@ -147,18 +165,15 @@ def signup_user(user: user_create.UserCreate, db: Session = Depends(get_db)):
     # add the user to db
     hash_pw = bcrypt.hashpw(user.password.encode(), bcrypt.gensalt())
     #bcrypt is a password hashing algorithm.
-    #why encode because it understands only bytes the bcrypt 
+    #why encode because it understands only bytes the bcrypt
     #why salt two user same passwords but diff hashcodes due to salt
     user_db = User(id=str(uuid.uuid4()), name=user.name, email=user.email, password=hash_pw)
     #now we will be hashing the password bcuz if someone gets acces to db we dont want him to access the password
-    #of users directly  
+    #of users directly
     db.add(user_db)
     db.commit()
     db.refresh(user_db)
-    return user_db
-    # print(user.name)
-    # print(user.email)
-    # print(user.password)
+    return _user_out(user_db)
 
 
 # DEPRECATED: Email/password login is deprecated. Use POST /auth/firebase instead.
@@ -168,32 +183,31 @@ def login_user(user: UserLogin, db: Session = Depends(get_db)):
 
     if not user_db:
         raise HTTPException(400, 'User with this email does not exist!')
-    
+
+    # Google / phone users have no password, so they can't use this endpoint.
+    if not user_db.password:
+        raise HTTPException(400, 'This account uses Google or phone login.')
+
     #password matching if it exits
     is_match = bcrypt.checkpw(user.password.encode(), user_db.password)
 
     if not is_match:
         raise HTTPException(400, 'Incorrect Password!')
 
-    
     token = jwt.encode(payload={'id': user_db.id}, key=JWT_SECRET)
-    return {'token': token, 'user': user_db}
-    pass
+    return {'token': token, 'user': _user_out(user_db)}
 
 
 @router.get('/')
-def get_current_user_data(db:Session = Depends(get_db),
-                          user_dic:dict = Depends(AuthMiddleware)):
+def get_current_user_data(db: Session = Depends(get_db),
+                          user_dic: dict = Depends(AuthMiddleware)):
     #get the user token from headers
     # This is another FastAPI feature.
     # Instead of reading JSON,
     # it reads an HTTP Header.
-    user = db.query(User).filter(User.id==user_dic['uid']).options(
-        joinedload(User.favourites)).first()
+    user = _load_with_favourites(db, user_dic['uid'])
 
     if not user:
-        raise HTTPException(401,"User invalid!")
+        raise HTTPException(401, "User invalid!")
 
-    return user
-    
-    pass
+    return _user_out(user)
