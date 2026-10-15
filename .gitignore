@@ -13,3 +13,5 @@ __pycache__/
 
 # db (if you ever use sqlite locally)
 *.db
+
+firebase-service-account.json
