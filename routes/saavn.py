@@ -432,3 +432,79 @@ async def search(
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(503, "Search is taking too long. Try again in a moment.")
+
+
+
+# ---------------------------------------------------------------------------
+# Lyrics  (paste at the END of routes/saavn.py)
+# ---------------------------------------------------------------------------
+
+_lyrics_cache: dict = {}      # saavn id -> lyrics text, or None when Saavn has none
+LYRICS_CACHE_MAX = 300
+LYRICS_TIMEOUT = 20
+
+
+def _clean_lyrics(raw) -> Optional[str]:
+    """Saavn returns lyrics as HTML (<br> between lines). Make it plain text."""
+    if not raw or not isinstance(raw, str):
+        return None
+    text = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text or None
+
+
+def _fetch_lyrics_sync(saavn_id: str):
+    """Returns (text, ok). ok=False means a temporary failure: don't cache it."""
+    try:
+        return _clean_lyrics(SaavnService.get_lyrics(saavn_id)), True
+    except KeyError:
+        return None, True          # Saavn answered, but has no lyrics for this song
+    except Exception as e:
+        print(f"[saavn] lyrics failed for {saavn_id}: {type(e).__name__}: {e!r}")
+        return None, False
+
+
+async def _fetch_lyrics_remote(saavn_id: str):
+    try:
+        async with httpx.AsyncClient(timeout=LYRICS_TIMEOUT) as client:
+            r = await client.get(f"{SAAVN_API_URL}/lyrics/", params={"query": saavn_id})
+        if r.status_code == 200:
+            return _clean_lyrics(r.json().get("lyrics")), True
+        return None, r.status_code == 404
+    except Exception as e:
+        print(f"[saavn] remote lyrics failed for {saavn_id}: {type(e).__name__}: {e!r}")
+        return None, False
+
+
+@router.get("/lyrics")
+async def lyrics(
+    id: str = Query(..., min_length=1, max_length=80),
+    auth_details=Depends(auth_middleware.AuthMiddleware),
+):
+    """Lyrics for a Saavn song. Answers {"lyrics": "..."} or {"lyrics": null}."""
+    if not id.startswith("saavn_"):
+        return {"lyrics": None}    # uploaded songs have no lyrics
+    saavn_id = id[len("saavn_"):]
+
+    if saavn_id in _lyrics_cache:
+        return {"lyrics": _lyrics_cache[saavn_id]}
+
+    try:
+        if USE_REMOTE:
+            text, ok = await asyncio.wait_for(_fetch_lyrics_remote(saavn_id), LYRICS_TIMEOUT + 5)
+        else:
+            text, ok = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_lyrics_sync, saavn_id), LYRICS_TIMEOUT
+            )
+    except asyncio.TimeoutError:
+        raise HTTPException(503, "Lyrics are taking too long. Try again in a moment.")
+
+    if not ok:
+        raise HTTPException(503, "Lyrics service is busy. Try again in a moment.")
+
+    if len(_lyrics_cache) >= LYRICS_CACHE_MAX:
+        _lyrics_cache.pop(next(iter(_lyrics_cache)))
+    _lyrics_cache[saavn_id] = text
+    return {"lyrics": text}
