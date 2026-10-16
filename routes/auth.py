@@ -100,14 +100,24 @@ def firebase_login(auth_data: FirebaseAuth, db: Session = Depends(get_db)):
 
     email = decoded_token.get('email')
     phone = decoded_token.get('phone_number')
-    name = decoded_token.get('name', '') or decoded_token.get('phone_number', 'User')
+    email_verified = bool(decoded_token.get('email_verified'))
+    # Name: Firebase display name, else the part of the email before '@'
+    name = (
+        decoded_token.get('name')
+        or (email.split('@')[0] if email else None)
+        or phone
+        or 'User'
+    )
 
     # Look up user by firebase_uid
     user_db = db.query(User).filter(User.firebase_uid == uid).options(joinedload(User.favourites)).first()
 
     if not user_db:
-        # Check if an existing (old email/password) account with the same email exists to link
-        if email:
+        # Link an existing account with the same email ONLY if Firebase says the
+        # email is verified. Google sign-in is always verified; a fresh
+        # email/password sign-up is not, and linking on an unverified email would
+        # let anyone take over someone else's account by signing up with their email.
+        if email and email_verified:
             existing_user = db.query(User).filter(User.email == email).options(joinedload(User.favourites)).first()
             if existing_user and not existing_user.firebase_uid:
                 existing_user.firebase_uid = uid
